@@ -22,6 +22,18 @@ class SQLConnection:
         self.dialect = dialect
         self.driver = driver
         self.url = url
+        self._engine = None
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        # SQLAlchemy Engine contains connection pools and thread locks
+        # that are not picklable. The engine will be lazily recreated
+        # via _get_or_create_engine() after deserialization.
+        state["_engine"] = None
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
 
     def __repr__(self) -> str:
         # Deliberately omit the URL: secrets can appear anywhere in a
@@ -126,9 +138,8 @@ class SQLConnection:
             "redshift",
         }
 
-        if isinstance(self.conn, str):
-            if self.dialect in connectorx_supported_dbs and self.driver == "":
-                return True
+        if isinstance(self.conn, str) and self.dialect in connectorx_supported_dbs and self.driver == "":
+            return True
         return False
 
     def execute_sql_query(self, sql: str, schema: pa.Schema | None = None) -> pa.Table:
@@ -153,13 +164,40 @@ class SQLConnection:
             # so the URL is redundant here.
             raise RuntimeError(f"Failed to execute sql: {sql}, error: {e}") from e
 
+    def _get_or_create_engine(self):
+        """Get or create a cached SQLAlchemy engine for string connection URLs."""
+        if self._engine is None and isinstance(self.conn, str):
+            from sqlalchemy import create_engine
+
+            url = self.conn
+            # B3: Auto-rewrite mysql:// to mysql+pymysql:// when pymysql is available
+            # but mysqlclient is not. This avoids ModuleNotFoundError: No module named 'MySQLdb'
+            if url.startswith("mysql://"):
+                try:
+                    import MySQLdb  # noqa: F401
+                except ImportError:
+                    try:
+                        import pymysql  # noqa: F401
+
+                        url = url.replace("mysql://", "mysql+pymysql://", 1)
+                        logger.info("Rewrote mysql:// to mysql+pymysql:// (MySQLdb not available)")
+                    except ImportError:
+                        logger.warning(
+                            "mysql:// URL detected but neither MySQLdb nor pymysql is installed. "
+                            "Install pymysql to avoid ModuleNotFoundError: No module named 'MySQLdb'."
+                        )
+
+            self._engine = create_engine(url)
+        return self._engine
+
     def _execute_sql_query_with_sqlalchemy(self, sql: str, schema: pa.Schema | None = None) -> pa.Table:
-        from sqlalchemy import create_engine, text
+        from sqlalchemy import text
 
         logger.info("Using sqlalchemy to execute sql: %s", sql)
         try:
             if isinstance(self.conn, str):
-                with create_engine(self.conn).connect() as connection:
+                engine = self._get_or_create_engine()
+                with engine.connect() as connection:
                     result = connection.execute(text(sql))
                     rows = result.fetchall()
             else:
